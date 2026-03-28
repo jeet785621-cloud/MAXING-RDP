@@ -1,0 +1,126 @@
+name: 6-Day RDP Session (Tailscale)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_days:
+        description: 'Duration in days (1-6)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+
+jobs:
+  rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: 8640   # 6 days max
+
+    steps:
+      - name: Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Port" dir=in action=allow protocol=TCP localport=3389
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fAudioCapture" -Value 1 -Force
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
+          $password = -join ((1..12) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDPUser" -Password $securePassword -AccountNeverExpires
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Set runneradmin password
+        run: |
+          $newPassword = "MAXMAXGLt890"   # ← CHANGE THIS PASSWORD
+          $securePassword = ConvertTo-SecureString $newPassword -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $securePassword
+          Write-Host "runneradmin password set to: $newPassword"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Remove-Item $installerPath -Force
+          $tailscaleExe = Get-ChildItem -Path "C:\Program Files\Tailscale" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $tailscaleExe) {
+            Write-Error "Tailscale installation failed."
+            exit 1
+          }
+          echo "TAILSCALE_EXE=$($tailscaleExe.FullName)" >> $env:GITHUB_ENV
+
+      - name: Connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TS_AUTHKEY) {
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing."
+            exit 1
+          }
+          & "$env:TAILSCALE_EXE" up --authkey=$env:TS_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 30) {
+              $tsIP = & "$env:TAILSCALE_EXE" ip -4 2>$null
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              } else {
+                  break
+              }
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Restrict RDP Firewall to Tailscale Only
+        run: |
+          netsh advfirewall firewall delete rule name="RDP-Port"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          Write-Host "RDP now accessible only via Tailscale IP."
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "`n========================================="
+          Write-Host "     RDP CONNECTION INFO (Tailscale)"
+          Write-Host "========================================="
+          Write-Host ""
+          Write-Host "🔒 Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "👤 Username: RDPUser"
+          Write-Host "🔑 Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "💻 runneradmin password: MyStrongPass123! (if you need to install software)"
+          Write-Host ""
+          Write-Host "Duration: ${{ inputs.duration_days }} days"
+          Write-Host "Started: $(Get-Date)"
+          Write-Host "Expires: $((Get-Date).AddDays(${{ inputs.duration_days }}))"
+          Write-Host ""
+          Write-Host "📱 iOS Connection:"
+          Write-Host "1. Install Tailscale on your iPhone (App Store)"
+          Write-Host "2. Log in with your Tailscale account"
+          Write-Host "3. Install Microsoft Remote Desktop"
+          Write-Host "4. Add PC with address: $env:TAILSCALE_IP"
+          Write-Host "5. Username: RDPUser, Password: $env:RDP_PASSWORD"
+          Write-Host "========================================="
+
+      - name: Keep Session Alive
+        run: |
+          $days = ${{ inputs.duration_days }}
+          $totalHours = $days * 24
+          for ($i = 1; $i -le $totalHours; $i++) {
+              $remaining = $totalHours - $i
+              Write-Host "[$(Get-Date)] Hour $i of $totalHours - $remaining hours remaining"
+              Start-Sleep -Seconds 3600
+          }
